@@ -1,0 +1,339 @@
+---
+title: "Classify US (2018) stocks by Financial Indicators"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+header-includes:
+  - \usepackage{fontspec}
+  - \setmainfont{Times New Roman}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(MASS)      # LDA, QDA
+library(class)     # kNN
+library(caret)     # train/test split
+library(nnet)      # logistic regression
+library(dplyr)
+library(e1071)     
+library(cluster)
+library(glmnet)
+library(pROC)
+```
+
+# Context
+
+Using over 200 financial indicators to classify whether a stock's price will increase during 2018. In other words, the goal is to determine whether an investor should buy the stock at the beginning of 2018 or not.
+
+# Data set
+
+To set up the data realistically and avoid overfitting, removing the percentage price variation column is recommended to ensure that the model uses only information available at the time of prediction. This column is directly linked to the Class variable and would not be known at the start of 2018.
+
+Example:
+If a stock's `X2019.PRICE.VAR...` value is positive, then the stock is labeled as `Class = 1`, meaning an investor should buy the stock at the start of 2018 and sell it at the end of the year. Conversely, if the value is negative, it is labeled as `Class = 0`, suggesting that the stock should not be bought under this model.
+
+This setup better mirrors a real-world investment decision, where actions must be taken without future information. The models are trained to predict `Class`, which represents whether a stock would have been a profitable buy at the start of 2018.
+
+Source: https://www.kaggle.com/datasets/cnic92/200-financial-indicators-of-us-stocks-20142018/data
+
+## Cleaning and preparing the dataset
+```{r}
+data <- read.csv("2018_Financial_Data.csv")
+
+#Drop stock % price variation, symbol (X) and Sector
+data <- data |> select(-X, -Sector, -`X2019.PRICE.VAR....`, -operatingProfitMargin)
+#-operatingProfitMargin because it is a col of just a constanst of 1
+
+# Print out dropped cols
+print(colnames(data[, colMeans(is.na(data)) > 0.80]))
+# Drop columns with more than 20% NAs
+data <- data[, colMeans(is.na(data)) <= 0.20]
+
+# Fill missing vals with mean cols
+data <- data |>
+  mutate(across(where(is.numeric), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+# Set as factor
+data$Class <- as.factor(data$Class)
+
+# Split train/test
+set.seed(123)
+index <- createDataPartition(data$Class, p = 0.7, list = FALSE)
+train <- data[index, ]
+test <- data[-index, ]
+
+#Normalize all numeric cols
+train_x <- train %>%
+  select(-Class) %>%
+  scale()
+
+train_glm <- as.data.frame(train_x)
+train_y <- train$Class
+train_glm$Class <- train_y
+
+# Scale the same with train set
+test_x <- test %>%
+  select(where(is.numeric)) %>%
+  scale(
+    center = attr(train_x, "scaled:center"),
+    scale  = attr(train_x, "scaled:scale")
+  )
+
+test_glm <- as.data.frame(test_x)
+test_y <- test$Class
+test_glm$Class <- test_y
+```
+
+
+```{r}
+set.seed(123)
+# 10-folds cv
+ctrl <- trainControl(method = "cv", number = 10)
+```
+
+## Variable Selections
+
+Due to multicollinearity among predictors, LASSO was used to reduce redundancy and retain only revelant features. This improves model stability, interpretability, and helps prevent overfitting in a high-dimensional financial dataset.
+
+```{r, warning= FALSE}
+# Setting up
+x <- model.matrix(Class ~ ., data = train_glm)[, -1]
+
+#LASSO
+cvfit <- cv.glmnet(x, train_glm$Class, family = "binomial", alpha = 1)
+
+# Get selected variables
+selected_vars <- coef(cvfit, s = "lambda.min")
+selected_vars <- rownames(selected_vars)[which(selected_vars != 0)][-1]
+
+#Filter train/test
+
+filtered_train <- train_glm[, c(selected_vars,"Class")]
+filtered_test <- test_glm[,c(selected_vars,"Class")]
+```
+
+# Logistic Regression
+
+```{r, warning=FALSE}
+set.seed(123)
+# Train with cv
+log_model <- train(Class ~ ., data = filtered_train, 
+                   method = "glm", family = "binomial", trControl = ctrl)
+summary(log_model)
+```
+
+The logistic regression model identifies several key financial predictors that significantly influence whether a stock is classified as "buy-worthy." Notably, dividend per share emerged as a highly significant variable, suggesting that investors favor companies providing consistent income returns. Similarly, price-to-earnings ratio and enterprise value to sales indicate that valuation metrics play a crucial role in stock selection.
+
+Profitability indicators such as pre-tax profit margin and EPS diluted growth reflect strong earnings potential and efficiency, further enhancing a stock’s appeal. The model also highlights the importance of financial structure: companies with lower net debt and strong interest coverage are perceived as less risky, making them more attractive to investors. Additionally, operational efficiency metrics such as SG&A to revenue ratio and days of inventory outstanding reveal that cost control and inventory management are relevant to stock performance. The significance of tangible book value per share and 5-year net income per share growth emphasizes the market’s preference for companies with both real asset backing and sustained long-term growth.
+
+In terms of statistical significance, several expected financial predictors are significant at the 0.05 level, including `Revenue`, `Gross.Profit`, `Operating.Expenses`, and `Net.Debt`, which reflect a company's core financial health and operational efficiency. Additionally, `Tangible.Book.Value.per.Share` and `Dividend.per.Share` are highly significant at the 0.001 level, reinforcing the importance of tangible value and direct shareholder returns in identifying stocks with strong buy potential.
+
+```{r}
+#Predict
+log_probs <- predict(log_model, newdata = filtered_test, type = "prob")[,2]
+# Covert to class labels
+log_pred <- ifelse(log_probs > 0.5, "1", "0")
+log_pred <- factor(log_pred, levels = levels(test_glm$Class))
+#Confusion matrix
+log_cm <- confusionMatrix(log_pred, test_glm$Class)
+log_cm
+```
+
+The logistic regression model achieved an accuracy of 70.36%, only slightly higher than the No Information Rate (NIR) of 69.38%, which represents the accuracy of always predicting the majority class. The associated p-value (0.2279) suggests that this improvement is not statistically significant, indicating that the model may not perform much better than a naive baseline.
+
+```{r}
+log_probs_1 <- predict(log_model, newdata = filtered_test, type = "prob")[,2]
+#ROC curves
+roc_log <- roc(filtered_test$Class, log_probs_1)
+plot(roc_log,col = "blue", main = "ROC Curve", print.auc = TRUE)
+auc_value_log <- auc(roc_log)
+legend("bottomright", legend = paste("AUC =", round(auc_value_log, 4)), col = "blue", lwd = 2)
+```
+
+The ROC curve suggests that the logistic model performs only moderately better than random guessing, with an AUC of 0.688. While it shows some predictive power, its ability to separate classes is limited, indicating room for improvement through further tuning or more flexible models.
+
+```{r}
+log_plot_data <- data.frame(TrueClass = filtered_test$Class,
+                        PredictedClass = log_pred)
+
+log_plot_data$Correct <- ifelse(log_plot_data$TrueClass ==
+                                  log_plot_data$PredictedClass, "Correct", "Incorrect")
+
+# plot
+ggplot(log_plot_data, aes(x = TrueClass, y = PredictedClass, color = Correct)) +
+  geom_jitter(width = 0.2, height = 0.2, alpha = 0.7) +
+  labs(title = "Scatter Plot of Predictions (Logistic Model)",
+       x = "True Class", y = "Predicted Class") +
+  theme_light() +
+  scale_color_manual(values = c("green", "red"))
+```
+
+As shown in the plot, Logistic mode perform consistently well with `Class = 1` but fail to do the same for `Class = 0`.
+
+# LDA (Linear Discriminant Analysis)
+
+
+```{r}
+set.seed(123)
+lda_model <- train(Class ~ ., data = filtered_train,
+                      method = "lda",
+                      preProcess = "pca",# Reduce collinearity
+                      trControl = ctrl)
+lda_model
+```
+After applying PCA to reduce multicollinearity, the LDA model with 10-fold CV achieved 69.86% accuracy and a Kappa of 0.069. While accuracy is decent, the low Kappa indicates that the model might be struggle to classify the minority class, suggesting LDA may not capture the data's complexity well.
+
+```{r}
+lda_probs <- predict(lda_model,filtered_test)
+lda_cm <- confusionMatrix(lda_probs,filtered_test$Class)
+lda_cm
+```
+
+The LDA model achieved a test accuracy of 69.98%, which is only marginally better than the No Information Rate of 69.38%. The p-value of 0.328 further suggests that this improvement is not statistically significant. Overall, LDA performs only slightly better than the logistic regression model, which had an accuracy of 70.36%
+
+```{r}
+lda_probs_1 <- predict(lda_model, filtered_test, type = "prob")[,2]
+roc_lda <- roc(filtered_test$Class, lda_probs_1)
+plot(roc_lda,col = "red", main = "ROC Curve", print.auc = TRUE)
+auc_value_lda <- auc(roc_lda)
+legend("bottomright", legend = paste("AUC =", round(auc_value_lda, 4)), col = "red", lwd = 2)
+```
+
+Again, the AUC of 0.666 suggests that the LDA model only slightly better than random guessing.
+
+```{r}
+lda_plot_data <- data.frame(TrueClass = filtered_test$Class,
+                        PredictedClass = lda_probs)
+
+lda_plot_data$Correct <- ifelse(lda_plot_data$TrueClass == lda_plot_data$PredictedClass, "Correct", "Incorrect")
+
+# Scatter plot
+ggplot(lda_plot_data, aes(x = TrueClass, y = PredictedClass, color = Correct)) +
+  geom_jitter(width = 0.2, height = 0.2, alpha = 0.7) +
+  labs(title = "Scatter Plot of Predictions (LDA Model)",
+       x = "True Class", y = "Predicted Class") +
+  theme_light() +
+  scale_color_manual(values = c("green", "red"))
+```
+
+The plot shows that while the LDA model performs well on `Class = 1`, it consistently struggles to identify `Class = 0`.
+
+# QDA (Quadratic Discriminant Analysis)
+
+
+```{r}
+set.seed(123)
+qda_model <- train(Class ~ ., data = filtered_train,
+                      method = "qda",
+                      preProcess = "pca",   
+                      trControl = ctrl)
+qda_model
+```
+The QDA model achieved an accuracy of 69.11% and a kappa of 0.070 based on the training set. This performance is slightly lower than the LDA model (accuracy = 69.99%), suggesting that the added flexibility of QDA may not improve predictive power significantly for this dataset. 
+
+```{r}
+qda_probs <- predict(qda_model,filtered_test)
+qda_cm <- confusionMatrix(qda_probs,filtered_test$Class)
+qda_cm
+```
+The QDA model achieved an accuracy of 68.84%, slightly lower than the No Information Rate of 69.38%, with a p-value of 0.6742 on test set. Similar to LDA, it struggles to classify the minority class, as indicated by a low Kappa value and high p-value, and offers no significant improvement over baseline guessing.
+
+```{r}
+qda_probs_1 <-  predict(qda_model, filtered_test, type = "prob")[,2]
+roc_qda <- roc(filtered_test$Class, qda_probs_1)
+plot(roc_qda,col = "green", main = "ROC Curve", print.auc = TRUE)
+auc_value_qda <- auc(roc_qda)
+legend("bottomright", legend = paste("AUC =", round(auc_value_qda, 4)), col = "green", lwd = 2)
+```
+
+The limitation of the QDA model is evident in the ROC curve, with an AUC of 65.22%, only slightly above the 50% baseline of random guessing.
+
+```{r}
+qda_plot_data <- data.frame(TrueClass = filtered_test$Class,
+                        PredictedClass = qda_probs)
+
+qda_plot_data$Correct <- ifelse(qda_plot_data$TrueClass == qda_plot_data$PredictedClass, "Correct", "Incorrect")
+
+# Scatter plot
+ggplot(qda_plot_data, aes(x = TrueClass, y = PredictedClass, color = Correct)) +
+  geom_jitter(width = 0.2, height = 0.2, alpha = 0.7) +
+  labs(title = "Scatter Plot of Predictions (QDA Model)",
+       x = "True Class", y = "Predicted Class") +
+  theme_light() +
+  scale_color_manual(values = c("green", "red"))
+```
+
+This plot shows that QDA model perform extremely well with `Class = 1` while struggling to classify `Class = 0` correctly.
+
+```{r}
+set.seed(123)
+knn_model <- train(Class ~ ., data = filtered_train, method = "knn",
+      tuneLength = 20,
+      trControl = ctrl)
+knn_model
+knn_model$bestTune
+```
+
+The best k is 41 which produce the highest accuracy of 70.55% with Kappa of 0.226 thus then used in KNN model.
+
+```{r}
+knn_probs <- predict(knn_model,filtered_test)
+knn_cm <- confusionMatrix(knn_probs,filtered_test$Class)
+knn_cm
+```
+
+Even with the filtered dataset reduced to 45 predictors from over 200, the kNN model likely still suffers from the curse of dimensionality. Its test accuracy of 68.47% slightly higher than the No Information Rate of 69.38%, and the high p-value (0.7731) indicates that the model performs no better than random guessing. 
+
+```{r}
+knn_probs_1 <- predict(knn_model, filtered_test, type = "prob")[,2]
+roc_knn <- roc(filtered_test$Class, knn_probs_1)
+plot(roc_knn,col = "green", main = "ROC Curve", print.auc = TRUE)
+auc_value_knn <- auc(roc_knn)
+legend("bottomright", legend = paste("AUC =", round(auc_value_knn, 4)), col = "green", lwd = 2)
+```
+
+The ROC curve also shows that the KNN model, AUC of 0.699, is only a bit above the baseline of random guessing.
+
+
+```{r}
+knn_plot_data <- data.frame(TrueClass = filtered_test$Class,
+                        PredictedClass = knn_probs)
+
+knn_plot_data$Correct <- ifelse(knn_plot_data$TrueClass == knn_plot_data$PredictedClass, "Correct", "Incorrect")
+
+# Scatter plot
+ggplot(knn_plot_data, aes(x = TrueClass, y = PredictedClass, color = Correct)) +
+  geom_jitter(width = 0.2, height = 0.2, alpha = 0.7) +
+  labs(title = "Scatter Plot of Predictions (KNN Model)",
+       x = "True Class", y = "Predicted Class") +
+  theme_light() +
+  scale_color_manual(values = c("green", "red"))
+
+```
+
+The scatter plot shows that while the KNN model reliably predicts `Class = 1`, it performs poorly on `Class = 0`, misclassifying many observations. This indicates a strong bias toward predicting the majority class and highlights the model’s weakness in handling class imbalance. 
+
+```{r}
+# Comparing all models accuracy and Kappa
+model_results <- data.frame(
+  Model = c("Logistic Regression", "LDA", "QDA", "KNN"),
+  Accuracy = c(log_cm$overall["Accuracy"], lda_cm$overall["Accuracy"], qda_cm$overall["Accuracy"], knn_cm$overall["Accuracy"]),
+  Kappa = c(log_cm$overall["Kappa"], lda_cm$overall["Kappa"], qda_cm$overall["Kappa"], knn_cm$overall["Kappa"]),
+    P_Value = c(log_cm$overall["AccuracyPValue"], lda_cm$overall["AccuracyPValue"], qda_cm$overall["AccuracyPValue"], knn_cm$overall["AccuracyPValue"])
+)
+model_results <- model_results[order(model_results$Accuracy,decreasing = TRUE), ]
+model_results
+```
+
+Since Logistic and LDA models perform slightly better than KNN and QDA models, linear models would be more appropriate in this case but non perform strongly overall.
+
+# Conclusion
+
+The models attempt to predict future stock movements based solely on financial indicators available at the beginning of 2018, making the analysis realistic and economically meaningful. Correctly identifying stocks likely to rise would enable investors to make profitable buy decisions, directly impacting portfolio returns.
+
+However, the relatively low AUC and low Kappa values across models suggest that predictive power is limited, meaning financial indicators alone may not be sufficient for reliable investment decisions. This reflects real-world challenges, as markets are influenced by unpredictable factors beyond what financial ratios capture.
+
+In addition, the models’ struggles to classify the minority class highlight a major limitation. Using models better suited for imbalanced data may improve prediction accuracy and better capture important stock volatility and movements
+
+Overall, while the current models provide some guidance, their practical economic benefit is limited without further model improvements or incorporating more economic signals.
